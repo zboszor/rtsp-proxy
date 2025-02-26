@@ -4,13 +4,13 @@
  * Theory of operation:
  * 1. The source feed must produce a specific resolution video.
  *    Since we can't know this resolution in advance,
- *    command line argument --dim WxH must be passed to produce
+ *    command line argument --res WxH must be passed to produce
  * 2. Initially produce blank image frames of this specific resolution
  *    and feed it to the destination.
  *    The destination is usually an RTSP multiplexing server,
  *    provided by e.g. rtsp-simple-server or mediamtx.
  * 3. When we can connect to the source feed, start reading frames
- *    and feed it to the destination instead of the black frame.
+ *    and feed it to the destination instead of the blank frame.
  * 4. When the source feed drops out (detected by ffmpeg), use the
  *    last received frame to keep feeding  it to the destination.
  *    Reconnection to the source feed will be attempted.
@@ -26,13 +26,14 @@
  * rtsp-proxy \
  *    --src rtsp://192.168.2.132/Preview_01_main \
  *    --dst rtsp://127.0.0.1/new_feed_name \
- *    --dim 1024x768 --fps 15
+ *    --res 1024x768 --fps 15
  *
  * Defaults:
- * --dim 800x600
- * --fps 30
+ * --res 800x600
+ * --fps 15
  *
- * Source and destination must be specified.
+ * Source and destination URLs must be specified.
+ * The same parameters can be set from an ini file, see README.md
  */
 
 #include <config.h>
