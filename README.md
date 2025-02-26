@@ -41,4 +41,6 @@ The resolution and the frame rate of the source feed may not be
 known in advance, so the destination feed parameters have to be
 set manually.
 
+Build tested with FFmpeg 7.0.x and 7.1.
+
 (C) 2025 Zoltán Böszörményi <zboszor@gmail.com>
