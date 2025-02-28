@@ -73,6 +73,7 @@ static volatile int quit_program = 0;
 
 static char *dst_url;
 static char *src_url;
+static char *src_accel;
 static char *fps;
 static char *res;
 static char *src_delay;
@@ -81,11 +82,15 @@ static char *src_delay;
 AVFrame *frames[NFRAMES];
 volatile int frame_idx; /* 0 or 1 */
 
+static AVBufferRef *hw_enc_ctx = NULL;
 static enum AVPixelFormat pixelformat = AV_PIX_FMT_YUV420P;
+static enum AVPixelFormat hwpixelformat;
+static enum AVHWDeviceType hwtype;
 static int dst_width;
 static int dst_height;
 static double fpsval;
 static long delay;
+static bool try_hwaccel;
 
 static void sighandler(int signum) {
 	quit_program = 1;
@@ -271,6 +276,18 @@ static int rtsp_source_interrupt_cb(void *dummy __attribute__((unused))) {
 	return 0;
 }
 
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+	const enum AVPixelFormat *p;
+
+	for (p = pix_fmts; *p != -1; p++) {
+		if (*p == hwpixelformat)
+			return *p;
+	}
+
+	printf("failed to get hardware surface format.\n");
+	return AV_PIX_FMT_NONE;
+}
+
 static void *thrfunc(void *arg) {
 	OutputStream *st = arg;
 
@@ -312,10 +329,26 @@ static void *thrfunc(void *arg) {
 				ret = quit_program ? AVERROR_EOF : av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
 				if (ret >= 0) {
 					int video_stream = ret;
+					bool use_hwaccel = try_hwaccel;
+
+					for (int i = 0; use_hwaccel; i++) {
+						const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+
+						if (config) {
+							if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+								config->device_type == hwtype) {
+								hwpixelformat = config->pix_fmt;
+								break;
+							}
+						} else {
+							printf("decoder %s does not support device type %s.\n", decoder->name, av_hwdevice_get_type_name(hwtype));
+							use_hwaccel = false;
+						}
+					}
 
 					dec = avcodec_alloc_context3(decoder);
 					if (!dec) {
-						printf("Out of memory\n");
+						printf("out of memory\n");
 						exit(1);
 					}
 
@@ -330,6 +363,22 @@ static void *thrfunc(void *arg) {
 
 					ret = quit_program ? -1 : avcodec_parameters_to_context(dec, video->codecpar);
 					if (ret >= 0) {
+						if (use_hwaccel) {
+							void *old_get_format = dec->get_format;
+							AVBufferRef *hw_dec_ctx = NULL;
+
+							dec->get_format  = get_hw_format;
+
+							ret = av_hwdevice_ctx_create(&hw_dec_ctx, hwtype, NULL, NULL, 0);
+							if (ret >= 0) {
+								dec->hw_device_ctx = av_buffer_ref(hw_dec_ctx);
+							} else {
+								printf("hardware decoder initialization failed\n");
+								dec->get_format = old_get_format;
+								use_hwaccel = false;
+							}
+						}
+
 						ret = quit_program ? AVERROR_EOF : avcodec_open2(dec, decoder, &opts);
 						if (ret >= 0) {
 							printf("Reader thread opened %s successfully.\n\n", src_url);
@@ -351,41 +400,71 @@ static void *thrfunc(void *arg) {
 								clock_gettime(CLOCK_MONOTONIC, &base_ts);
 								ret = quit_program ? AVERROR_EOF : av_read_frame(ic, dec_pkt);
 								if (ret >= 0) {
-									// check if the packet belongs to a stream we are interested in, otherwise
-									// skip it
+									/*
+									 * check if the packet belongs to a stream we are interested in,
+									 * otherwise skip it
+									 */
 									if (dec_pkt->stream_index == video_stream) {
 										/* submit the packet to the decoder */
 										ret = quit_program ? AVERROR_EOF : avcodec_send_packet(dec, dec_pkt);
 										if (ret >= 0) {
 											/* get all the available frames from the decoder */
-											AVFrame *dec_frame = NULL;
+											AVFrame *dec_frame = NULL, *hw_frame = NULL;
 											while (!quit_program && ret >= 0) {
 												dec_frame = av_frame_alloc();
+												if (use_hwaccel)
+													hw_frame = av_frame_alloc();
+												else {
+													dec_frame->width = dec->width;
+													dec_frame->height = dec->height;
+													dec_frame->format = dec->pix_fmt;
+													av_frame_get_buffer(dec_frame, 0);
+												}
 
-												dec_frame->width = dec->width;
-												dec_frame->height = dec->height;
-												dec_frame->format = dec->pix_fmt;
-												av_frame_get_buffer(dec_frame, 0);
-
-												int ret = quit_program ? AVERROR_EOF : avcodec_receive_frame(dec, dec_frame);
+												int ret = quit_program ? AVERROR_EOF : avcodec_receive_frame(dec, use_hwaccel ? hw_frame : dec_frame);
 												if (ret >= 0) {
+													AVFrame *tmp_frame = NULL;
+
+													if (use_hwaccel) {
+														if (hw_frame->format == hwpixelformat) {
+															/* retrieve data from GPU to CPU */
+															ret = av_hwframe_transfer_data(dec_frame, hw_frame, 0);
+															if (ret >= 0) {
+																tmp_frame = dec_frame;
+																dec_frame = NULL;
+															} else
+																printf("error transferring the data to system memory\n");
+														} else {
+															tmp_frame = hw_frame;
+															hw_frame = NULL;
+														}
+													} else {
+														tmp_frame = dec_frame;
+														dec_frame = NULL;
+													}
+
 													/* convert to destination format */
 													AVFrame *dst_frame = frames[1 - frame_idx];
 
-													if (dst_frame->width == dec_frame->width &&
-														dst_frame->height == dec_frame->height &&
+													if (dst_frame->width == tmp_frame->width &&
+														dst_frame->height == tmp_frame->height &&
 														pixelformat == dec->pix_fmt &&
-														dst_frame->linesize[0] == dec_frame->linesize[0] &&
-														dst_frame->linesize[0] == dec_frame->linesize[0] &&
-														dst_frame->linesize[0] == dec_frame->linesize[0]) {
+														dst_frame->linesize[0] == tmp_frame->linesize[0] &&
+														dst_frame->linesize[1] == tmp_frame->linesize[1] &&
+														dst_frame->linesize[2] == tmp_frame->linesize[2]) {
 														/* Zero copy transfer */
-														frames[1 - frame_idx] = dec_frame;
-														dec_frame = dst_frame;
+														static int report = 1;
+														if (report) {
+															report = 0;
+															printf("using zerocopy frame transfer\n");
+														}
+														frames[1 - frame_idx] = tmp_frame;
+														tmp_frame = dst_frame;
 														ret = 0;
 													} else {
 														ret = sws_scale(sws_ctx,
-																	(const uint8_t * const *)dec_frame->data,
-																	dec_frame->linesize, 0, dec_frame->height,
+																	(const uint8_t * const *)tmp_frame->data,
+																	tmp_frame->linesize, 0, tmp_frame->height,
 																	dst_frame->data, dst_frame->linesize);
 													}
 
@@ -398,7 +477,8 @@ static void *thrfunc(void *arg) {
 														printf("scaling failed: %s\n", av_err2str(ret));
 													}
 
-													av_frame_unref(dec_frame);
+													av_frame_unref(tmp_frame);
+													av_frame_free(&tmp_frame);
 												} else if (!quit_program) {
 													// those two return values are special and mean there is no output
 													// frame available, but there were no errors during decoding
@@ -410,6 +490,7 @@ static void *thrfunc(void *arg) {
 													}
 												}
 												av_frame_free(&dec_frame);
+												av_frame_free(&hw_frame);
 											}
 											av_frame_free(&dec_frame);
 										} else if (!quit_program) {
@@ -476,16 +557,25 @@ void parse_ini_file(const char *ininame, const char *section) {
 			for (j = 0; j < nkeys; j++) {
 				const char *onlykey = keys0[j] + sectlen;
 				const char *val = iniparser_getstring(dict, keys0[j], "");
-				if (strcasecmp(onlykey, "SourceURL") == 0 && val && *val)
+				if (strcasecmp(onlykey, "SourceURL") == 0 && val && *val) {
+					free(src_url);
 					src_url = strdup(val);
-				else if (strcasecmp(onlykey, "SourceDelay") == 0 && val && *val)
+				} else if (strcasecmp(onlykey, "SourceDelay") == 0 && val && *val) {
+					free(src_delay);
 					src_delay = strdup(val);
-				else if (strcasecmp(onlykey, "DestURL") == 0 && val && *val)
+				} else if (strcasecmp(onlykey, "DecodeHWAccel") == 0 && val && *val) {
+					free(src_accel);
+					src_accel = strdup(val);
+				} else if (strcasecmp(onlykey, "DestURL") == 0 && val && *val) {
+					free(dst_url);
 					dst_url = strdup(val);
-				else if (strcasecmp(onlykey, "DestResolution") == 0 && val && *val)
+				} else if (strcasecmp(onlykey, "DestResolution") == 0 && val && *val) {
+					free(res);
 					res = strdup(val);
-				else if (strcasecmp(onlykey, "DestFPS") == 0 && val && *val)
+				} else if (strcasecmp(onlykey, "DestFPS") == 0 && val && *val) {
+					free(fps);
 					fps = strdup(val);
+				}
 			}
 
 			free(keys);
@@ -501,6 +591,7 @@ int main(int argc, char **argv) {
 		{ "ini",	required_argument,	NULL,	'i' },
 		{ "src",	required_argument,	NULL,	's' },
 		{ "dst",	required_argument,	NULL,	'd' },
+		{ "src-accel",	required_argument,	NULL,	'a' },
 		{ "res",	required_argument,	NULL,	'r' },
 		{ "fps",	required_argument,	NULL,	'f' },
 		{ "src-delay",	required_argument,	NULL,	'w' },
@@ -516,7 +607,7 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, sighandler);
 
 	while (1) {
-		int c = getopt_long(argc, argv, "his:d:r:f:w:", opts, NULL);
+		int c = getopt_long(argc, argv, "a:his:d:r:f:w:", opts, NULL);
 
 		if (c == -1)
 			break;
@@ -528,26 +619,42 @@ int main(int argc, char **argv) {
 			printf("-i <section>, --ini <section>\n\tRead options from [section] in /etc/rtsp-proxy.ini\n");
 			printf("-s url, --src url\n\tSource video file or URL\n");
 			printf("-d url, --dst url\n\tDestination video file or URL\n");
+			printf("-a <accel>, --accel <accel>\n\tHardware acceleration method for decoding.\n");
+			printf("\tAvailable device types:");
+			hwtype = AV_HWDEVICE_TYPE_NONE;
+			while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
+				printf(" %s", av_hwdevice_get_type_name(hwtype));
+			printf("\n");
 			printf("-r WxH, --res WxH\n\tDestination video resolution\n");
 			printf("-f N, --fps N\n\tDestination video frame rate\n");
 			printf("-w N, --src-delay\n\tWait N seconds before opening the source\n");
-			break;
+			return 0;
 		case 'i':
-			inisection = optarg;
+			free(inisection);
+			inisection = optarg ? strdup(optarg) : NULL;
 			break;
 		case 's':
+			free(src_url);
 			src_url = optarg ? strdup(optarg) : NULL;
 			break;
 		case 'd':
+			free(dst_url);
 			dst_url = optarg ? strdup(optarg) : NULL;
 			break;
+		case 'a':
+			free(src_accel);
+			src_accel = optarg ? strdup(optarg) : NULL;
+			break;
 		case 'r':
+			free(res);
 			res = optarg ? strdup(optarg) : NULL;
 			break;
 		case 'f':
+			free(fps);
 			fps = optarg ? strdup(optarg) : NULL;
 			break;
 		case 'w':
+			free(src_delay);
 			src_delay = optarg ? strdup(optarg) : NULL;
 			break;
 		}
@@ -575,8 +682,17 @@ int main(int argc, char **argv) {
 
 	avformat_network_init();
 
+	hwtype = src_accel ? av_hwdevice_find_type_by_name(src_accel) : AV_HWDEVICE_TYPE_NONE;
+	if (hwtype == AV_HWDEVICE_TYPE_NONE) {
+		printf("Device type %s is not supported.\n", src_accel ? src_accel : "<unspecified>");
+		printf("Available device types:");
+		while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
+			printf(" %s", av_hwdevice_get_type_name(hwtype));
+		printf("\n\n");
+	} else
+		try_hwaccel = true;
+
 	/* YUV420P is likely the format the source (camera?) supplies. */
-	//int bufsize = av_image_get_buffer_size(pixelformat, dst_width, dst_height, 32);
 	for (int i = 0; i < NFRAMES; i++) {
 		frames[i] = av_frame_alloc();
 		frames[i]->width = dst_width;
