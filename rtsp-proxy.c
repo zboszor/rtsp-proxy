@@ -516,7 +516,7 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, sighandler);
 
 	while (1) {
-		int c = getopt_long(argc, argv, "hs:d:r:f:w:", opts, NULL);
+		int c = getopt_long(argc, argv, "his:d:r:f:w:", opts, NULL);
 
 		if (c == -1)
 			break;
