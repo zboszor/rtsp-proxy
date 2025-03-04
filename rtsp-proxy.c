@@ -363,9 +363,10 @@ static void *thrfunc(void *arg) {
 
 					ret = quit_program ? -1 : avcodec_parameters_to_context(dec, video->codecpar);
 					if (ret >= 0) {
+						AVBufferRef *hw_dec_ctx = NULL;
+
 						if (use_hwaccel) {
 							void *old_get_format = dec->get_format;
-							AVBufferRef *hw_dec_ctx = NULL;
 
 							dec->get_format  = get_hw_format;
 
@@ -507,6 +508,8 @@ static void *thrfunc(void *arg) {
 						} else if (!quit_program) {
 							printf("Failed to open codec for decoding. Error code: %s\n", av_err2str(ret));
 						}
+
+						av_buffer_unref(&hw_dec_ctx);
 					} else if (!quit_program) {
 						printf("avcodec_parameters_to_context error. Error code: %s\n", av_err2str(ret));
 					}
