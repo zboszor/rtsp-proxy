@@ -302,6 +302,8 @@ static void *thrfunc(void *arg) {
 	int ret;
 	AVCodecContext *dec = NULL;
 
+	bool use_hwaccel = try_hwaccel;
+
 	do {
 		AVFormatContext *ic = avformat_alloc_context();
 
@@ -329,7 +331,6 @@ static void *thrfunc(void *arg) {
 				ret = quit_program ? AVERROR_EOF : av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
 				if (ret >= 0) {
 					int video_stream = ret;
-					bool use_hwaccel = try_hwaccel;
 
 					for (int i = 0; use_hwaccel; i++) {
 						const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
@@ -369,6 +370,8 @@ static void *thrfunc(void *arg) {
 							void *old_get_format = dec->get_format;
 
 							dec->get_format  = get_hw_format;
+
+							printf("Attempting to use hardware acceleration for decoding\n");
 
 							ret = av_hwdevice_ctx_create(&hw_dec_ctx, hwtype, NULL, NULL, 0);
 							if (ret >= 0) {
