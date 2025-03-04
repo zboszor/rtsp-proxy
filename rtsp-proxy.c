@@ -768,6 +768,9 @@ int main(int argc, char **argv) {
 		av_dict_free(&opts);
 	} while (!quit_program && ret < 0);
 
+	if (quit_program)
+		return 0;
+
 	av_dump_format(st.oc, 0, dst_url, 1);
 
 	int64_t pts = 0;
