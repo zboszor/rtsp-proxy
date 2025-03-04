@@ -399,6 +399,11 @@ static void *thrfunc(void *arg) {
 
 							av_read_play(ic);
 
+							AVFrame *hw_frame = use_hwaccel ? av_frame_alloc() : NULL;
+							AVFrame *dec_frame = NULL;
+							bool use_zerocopy = false;
+							bool valid_zerocopy = false;
+
 							while (!quit_program && ret >= 0) {
 								use_timeout = true;
 								clock_gettime(CLOCK_MONOTONIC, &base_ts);
@@ -412,18 +417,31 @@ static void *thrfunc(void *arg) {
 										/* submit the packet to the decoder */
 										ret = quit_program ? AVERROR_EOF : avcodec_send_packet(dec, dec_pkt);
 										if (ret >= 0) {
-											/* get all the available frames from the decoder */
-											AVFrame *dec_frame = NULL, *hw_frame = NULL;
-											while (!quit_program && ret >= 0) {
-												dec_frame = av_frame_alloc();
-												if (use_hwaccel)
-													hw_frame = av_frame_alloc();
-												else {
+											if (!valid_zerocopy) {
+												valid_zerocopy = true;
+
+												use_zerocopy =
+													dst_width == dec->width &&
+													dst_height == dec->height && (
+														(use_hwaccel && pixelformat == dec->sw_pix_fmt) ||
+														(!use_hwaccel && pixelformat == dec->pix_fmt));
+
+												if (use_zerocopy) {
+													printf("rendering directly into destination frames\n");
+												} else {
+													dec_frame = av_frame_alloc();
+
 													dec_frame->width = dec->width;
 													dec_frame->height = dec->height;
-													dec_frame->format = dec->pix_fmt;
+													dec_frame->format = use_hwaccel ? dec->sw_pix_fmt : dec->pix_fmt;
 													av_frame_get_buffer(dec_frame, 0);
 												}
+											}
+
+											/* get all the available frames from the decoder */
+											while (!quit_program && ret >= 0) {
+												if (use_zerocopy)
+													dec_frame = frames[1 - frame_idx];
 
 												int ret = quit_program ? AVERROR_EOF : avcodec_receive_frame(dec, use_hwaccel ? hw_frame : dec_frame);
 												if (ret >= 0) {
@@ -435,37 +453,19 @@ static void *thrfunc(void *arg) {
 															ret = av_hwframe_transfer_data(dec_frame, hw_frame, 0);
 															if (ret >= 0) {
 																tmp_frame = dec_frame;
-																dec_frame = NULL;
 															} else
 																printf("error transferring the data to system memory\n");
 														} else {
 															tmp_frame = hw_frame;
-															hw_frame = NULL;
 														}
 													} else {
 														tmp_frame = dec_frame;
-														dec_frame = NULL;
 													}
 
 													/* convert to destination format */
-													AVFrame *dst_frame = frames[1 - frame_idx];
+													if (!use_zerocopy) {
+														AVFrame *dst_frame = frames[1 - frame_idx];
 
-													if (dst_frame->width == tmp_frame->width &&
-														dst_frame->height == tmp_frame->height &&
-														pixelformat == dec->pix_fmt &&
-														dst_frame->linesize[0] == tmp_frame->linesize[0] &&
-														dst_frame->linesize[1] == tmp_frame->linesize[1] &&
-														dst_frame->linesize[2] == tmp_frame->linesize[2]) {
-														/* Zero copy transfer */
-														static int report = 1;
-														if (report) {
-															report = 0;
-															printf("using zerocopy frame transfer\n");
-														}
-														frames[1 - frame_idx] = tmp_frame;
-														tmp_frame = dst_frame;
-														ret = 0;
-													} else {
 														ret = sws_scale(sws_ctx,
 																	(const uint8_t * const *)tmp_frame->data,
 																	tmp_frame->linesize, 0, tmp_frame->height,
@@ -480,12 +480,11 @@ static void *thrfunc(void *arg) {
 													} else {
 														printf("scaling failed: %s\n", av_err2str(ret));
 													}
-
-													av_frame_unref(tmp_frame);
-													av_frame_free(&tmp_frame);
 												} else if (!quit_program) {
-													// those two return values are special and mean there is no output
-													// frame available, but there were no errors during decoding
+													/*
+													 * These two return values are special and mean there is no output
+													 * frame available, but there were no errors during decoding
+													 */
 													if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
 														ret = 0;
 														break;
@@ -493,10 +492,7 @@ static void *thrfunc(void *arg) {
 														printf("error during decoding (%s)\n", av_err2str(ret));
 													}
 												}
-												av_frame_free(&dec_frame);
-												av_frame_free(&hw_frame);
 											}
-											av_frame_free(&dec_frame);
 										} else if (!quit_program) {
 											printf("error submitting a packet for decoding (%s)\n", av_err2str(ret));
 										}
@@ -504,6 +500,11 @@ static void *thrfunc(void *arg) {
 									av_packet_unref(dec_pkt);
 								}
 							}
+
+							if (!use_zerocopy)
+								av_frame_free(&dec_frame);
+							if (use_hwaccel)
+								av_frame_free(&hw_frame);
 
 							av_packet_free(&dec_pkt);
 							sws_freeContext(sws_ctx);
