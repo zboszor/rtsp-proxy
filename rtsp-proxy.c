@@ -678,19 +678,23 @@ int main(int argc, char **argv) {
 
 	printf("Source stream URL: %s\n", src_url ? src_url : "unset, error");
 	printf("Destination stream URL: %s\n", dst_url ? dst_url : "unset, error");
-	printf("Destination stream parameters: width x height: %dx%d @ %.2lf fps\n\n", dst_width, dst_height, fpsval);
+	printf("Destination stream parameters: width x height: %dx%d @ %.2lf fps\n", dst_width, dst_height, fpsval);
 
 	avformat_network_init();
 
 	hwtype = src_accel ? av_hwdevice_find_type_by_name(src_accel) : AV_HWDEVICE_TYPE_NONE;
-	if (hwtype == AV_HWDEVICE_TYPE_NONE) {
+	if (src_accel && hwtype == AV_HWDEVICE_TYPE_NONE) {
 		printf("Device type %s is not supported.\n", src_accel ? src_accel : "<unspecified>");
 		printf("Available device types:");
 		while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
 			printf(" %s", av_hwdevice_get_type_name(hwtype));
-		printf("\n\n");
-	} else
+		printf("\n");
+	} else {
+		printf("Attempting to use \"%s\" hardware acceleration\n", src_accel);
 		try_hwaccel = true;
+	}
+
+	printf("\n");
 
 	/* YUV420P is likely the format the source (camera?) supplies. */
 	for (int i = 0; i < NFRAMES; i++) {
