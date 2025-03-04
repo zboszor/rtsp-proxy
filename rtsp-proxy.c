@@ -800,5 +800,13 @@ int main(int argc, char **argv) {
 
 	avformat_network_init();
 
+	free(inisection);
+	free(src_url);
+	free(dst_url);
+	free(src_accel);
+	free(src_delay);
+	free(res);
+	free(fps);
+
 	return 0;
 }
