@@ -74,6 +74,7 @@ static volatile int quit_program = 0;
 static char *dst_url;
 static char *src_url;
 static char *src_accel;
+static char *dst_accel;
 static char *fps;
 static char *res;
 static char *src_delay;
@@ -83,14 +84,17 @@ AVFrame *frames[NFRAMES];
 volatile int frame_idx; /* 0 or 1 */
 
 static AVBufferRef *hw_enc_ctx = NULL;
-static enum AVPixelFormat pixelformat = AV_PIX_FMT_YUV420P;
+static enum AVPixelFormat pixelformat = AV_PIX_FMT_YUV420P; /* may be modified to NV12 */
 static enum AVPixelFormat hwpixelformat;
+static enum AVPixelFormat dst_hwpixelformat;
 static enum AVHWDeviceType hwtype;
+static enum AVHWDeviceType dst_hwtype;
 static int dst_width;
 static int dst_height;
 static double fpsval;
 static long delay;
 static bool try_hwaccel;
+static bool try_dst_hwaccel;
 
 static void sighandler(int signum) {
 	quit_program = 1;
@@ -100,14 +104,56 @@ typedef struct OutputStream {
 	AVFormatContext *oc;
 	AVStream *st;
 	AVCodecContext *enc;
+	AVFrame *hwframe;
 } OutputStream;
+
+static int set_hwframe_ctx(AVCodecContext *ctx, AVBufferRef *hw_device_ctx) {
+	AVBufferRef *hw_frames_ref;
+	AVHWFramesContext *frames_ctx = NULL;
+	int err = 0;
+
+	if (!(hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ctx))) {
+		fprintf(stderr, "Failed to create VAAPI frame context.\n");
+		return -1;
+	}
+
+	frames_ctx = (AVHWFramesContext *)(hw_frames_ref->data);
+	frames_ctx->format    = ctx->pix_fmt; /* AV_PIX_FMT_VAAPI or similar, depending on the acceleration device */
+	frames_ctx->sw_format = ctx->sw_pix_fmt;
+	frames_ctx->width     = dst_width;
+	frames_ctx->height    = dst_height;
+	frames_ctx->initial_pool_size = 20;
+	if ((err = av_hwframe_ctx_init(hw_frames_ref)) < 0) {
+		printf("failed to initialize VAAPI frame context: %s\n",av_err2str(err));
+		av_buffer_unref(&hw_frames_ref);
+		return err;
+	}
+	ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
+	if (!ctx->hw_frames_ctx)
+		err = AVERROR(ENOMEM);
+
+	av_buffer_unref(&hw_frames_ref);
+	return err;
+}
 
 static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **codec, enum AVCodecID codec_id) {
 	AVCodecContext *c;
 	int i, ret;
 
 	/* find the encoder */
-	*codec = avcodec_find_encoder(codec_id);
+	bool use_dst_hwaccel = try_dst_hwaccel;
+	if (use_dst_hwaccel && codec_id == AV_CODEC_ID_H264) {
+		char encoder_name[64];
+
+		snprintf(encoder_name, sizeof(encoder_name), "h264_%s", dst_accel);
+		encoder_name[63] = 0;
+
+		*codec = avcodec_find_encoder_by_name(encoder_name);
+		if (!*codec)
+			try_dst_hwaccel = use_dst_hwaccel = false;
+	}
+	if (!*codec)
+		*codec = avcodec_find_encoder(codec_id);
 	if (!(*codec)) {
 		fprintf(stderr, "Could not find encoder for '%s'\n", avcodec_get_name(codec_id));
 		exit(1);
@@ -127,10 +173,14 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **c
 		exit(1);
 	}
 
+	if (use_dst_hwaccel)
+		c->hw_device_ctx = hw_enc_ctx;
+
 	ost->enc = c;
 
 	const enum AVSampleFormat *sample_fmts = NULL;
 	const int *supported_samplerates = NULL;
+	const enum AVPixelFormat *supported_pixfmts = NULL;
 
 	switch ((*codec)->type) {
 	case AVMEDIA_TYPE_AUDIO:
@@ -177,7 +227,27 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **c
 		c->time_base       = ost->st->time_base;
 
 		c->gop_size      = 12; /* emit one intra frame every twelve frames at most */
-		c->pix_fmt       = pixelformat;
+
+#if FFMPEG_7_1
+		ret = avcodec_get_supported_config(c, NULL, AV_CODEC_CONFIG_PIX_FORMAT, 0, (const void**)&supported_pixfmts, NULL);
+#else
+		ret = 0;
+		supported_pixfmts = (*codec)->pix_fmts;
+#endif
+		if (supported_pixfmts && use_dst_hwaccel) {
+			dst_hwpixelformat = supported_pixfmts[0];
+			pixelformat = AV_PIX_FMT_NV12; /* TODO? how to deduce this automatically??? */
+		}
+		c->pix_fmt = use_dst_hwaccel ? dst_hwpixelformat : pixelformat;
+		if (use_dst_hwaccel) {
+			/*
+			 * Setting this may violate FFmpeg but it has this comment:
+			 * * Nominal unaccelerated pixel format, see AV_PIX_FMT_xxx.
+			 * * - encoding: unused.
+			 */
+			c->sw_pix_fmt = pixelformat;
+		}
+
 		if (c->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
 			/* just for testing, we also add B-frames */
 			c->max_b_frames = 2;
@@ -201,6 +271,20 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **c
 
 static int write_frame(OutputStream *ost, AVFrame *frame, AVPacket *pkt) {
 	int ret;
+
+	if (try_dst_hwaccel) {
+		ret = av_hwframe_get_buffer(ost->enc->hw_frames_ctx, ost->hwframe, 0);
+		if (ret < 0) {
+			printf("av_hwframe_get_buffer failed\n");
+			abort();
+		}
+
+		ret = av_hwframe_transfer_data(ost->hwframe, frame, 0);
+		if (ret < 0) {
+			printf("error while transferring frame data (format code %d vs %d) to surface: %s.\n", pixelformat, frame->format, av_err2str(ret));
+			exit(1);
+		}
+	}
 
 	/* send the frame to the encoder */
 	ret = avcodec_send_frame(ost->enc, frame);
@@ -570,6 +654,9 @@ void parse_ini_file(const char *ininame, const char *section) {
 				} else if (strcasecmp(onlykey, "DecodeHWAccel") == 0 && val && *val) {
 					free(src_accel);
 					src_accel = strdup(val);
+				} else if (strcasecmp(onlykey, "EncodeHWAccel") == 0 && val && *val) {
+					free(dst_accel);
+					dst_accel = strdup(val);
 				} else if (strcasecmp(onlykey, "DestURL") == 0 && val && *val) {
 					free(dst_url);
 					dst_url = strdup(val);
@@ -596,6 +683,7 @@ int main(int argc, char **argv) {
 		{ "src",	required_argument,	NULL,	's' },
 		{ "dst",	required_argument,	NULL,	'd' },
 		{ "src-accel",	required_argument,	NULL,	'a' },
+		{ "dst-accel",  required_argument,  NULL,   'b' },
 		{ "res",	required_argument,	NULL,	'r' },
 		{ "fps",	required_argument,	NULL,	'f' },
 		{ "src-delay",	required_argument,	NULL,	'w' },
@@ -611,7 +699,7 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, sighandler);
 
 	while (1) {
-		int c = getopt_long(argc, argv, "a:hi:s:d:r:f:w:", opts, NULL);
+		int c = getopt_long(argc, argv, "a:b:hi:s:d:r:f:w:", opts, NULL);
 
 		if (c == -1)
 			break;
@@ -624,6 +712,7 @@ int main(int argc, char **argv) {
 			printf("-s url, --src url\n\tSource video file or URL\n");
 			printf("-d url, --dst url\n\tDestination video file or URL\n");
 			printf("-a <accel>, --src-accel <accel>\n\tHardware acceleration method for decoding.\n");
+			printf("-b <accel>, --dst-accel <accel>\n\tHardware acceleration method for encoding.\n");
 			printf("\tAvailable device types:");
 			{
 				enum AVHWDeviceType hwtype = AV_HWDEVICE_TYPE_NONE;
@@ -650,6 +739,10 @@ int main(int argc, char **argv) {
 		case 'a':
 			free(src_accel);
 			src_accel = optarg ? strdup(optarg) : NULL;
+			break;
+		case 'b':
+			free(dst_accel);
+			dst_accel = optarg ? strdup(optarg) : NULL;
 			break;
 		case 'r':
 			free(res);
@@ -700,6 +793,18 @@ int main(int argc, char **argv) {
 		try_hwaccel = true;
 	}
 
+	dst_hwtype = dst_accel ? av_hwdevice_find_type_by_name(dst_accel) : AV_HWDEVICE_TYPE_NONE;
+	if (dst_accel && dst_hwtype == AV_HWDEVICE_TYPE_NONE) {
+		printf("Device type %s is not supported.\n", dst_accel ? dst_accel : "<unspecified>");
+		printf("Available device types:");
+		while((dst_hwtype = av_hwdevice_iterate_types(dst_hwtype)) != AV_HWDEVICE_TYPE_NONE)
+			printf(" %s", av_hwdevice_get_type_name(dst_hwtype));
+		printf("\n");
+	} else if (dst_accel) {
+		printf("Attempting to use %s hardware acceleration for encoding\n", dst_accel);
+		try_dst_hwaccel = true;
+	}
+
 	printf("\n");
 
 	avformat_alloc_output_context2(&st.oc, NULL, "rtsp", dst_url);
@@ -708,23 +813,47 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	const AVOutputFormat *fmt = st.oc->oformat;
-#if 1
-	enum AVCodecID codec_id = fmt->video_codec;
-#else
-	enum AVCodecID codec_id = AV_CODEC_ID_H264; /* too much CPU usage */
-#endif
-
-	const AVCodec *video_codec;
 	int ret;
+	const AVOutputFormat *fmt = st.oc->oformat;
+	enum AVCodecID codec_id = (dst_accel && dst_hwtype != AV_HWDEVICE_TYPE_NONE) ? AV_CODEC_ID_H264 : fmt->video_codec;
+
+	if (dst_accel && dst_hwtype != AV_HWDEVICE_TYPE_NONE) {
+		ret = av_hwdevice_ctx_create(&hw_enc_ctx, dst_hwtype, NULL, NULL, 0);
+		if (ret < 0) {
+			printf("failed to create acceleration (%s) device: %s\n", dst_accel, av_err2str(ret));
+			codec_id = fmt->video_codec;
+		}
+	}
+
+	const AVCodec *video_codec = NULL;
 	do {
 		add_stream(&st, st.oc, &video_codec, codec_id);
 
 		AVDictionary *opts = NULL;
 
+		if (try_dst_hwaccel) {
+			ret = set_hwframe_ctx(st.enc, hw_enc_ctx);
+			if (ret < 0)
+				try_dst_hwaccel = false;
+		}
+
 		/* open the codec */
 		ret = avcodec_open2(st.enc, video_codec, &opts);
 		if (ret >= 0) {
+			if (try_dst_hwaccel) {
+				if (set_hwframe_ctx(st.enc, hw_enc_ctx) < 0)
+					return 1;
+
+				st.hwframe = av_frame_alloc();
+#if 0
+				ret = av_hwframe_get_buffer(st.enc->hw_frames_ctx, st.hwframe, 0);
+				if (ret < 0) {
+					printf("av_hwframe_get_buffer failed\n");
+					abort();
+				}
+#endif
+			}
+
 			/* copy the stream parameters to the muxer */
 			ret = avcodec_parameters_from_context(st.st->codecpar, st.enc);
 			if (ret >= 0) {
@@ -771,10 +900,12 @@ int main(int argc, char **argv) {
 
 		av_frame_get_buffer(frames[i], 0);
 
+#if 0
 		/* Weird green frame */
 		memset(frames[i]->data[0], 0x80, frames[i]->linesize[0] * frames[i]->height);		/* Y = 0x80 */
 		memset(frames[i]->data[1], 0x00, frames[i]->linesize[1] * frames[i]->height / 2);	/* U = 0x00 */
 		memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
+#endif
 	}
 
 	int64_t pts = 0;
@@ -800,6 +931,7 @@ int main(int argc, char **argv) {
 
 	avcodec_free_context(&st.enc);
 	av_packet_free(&enc_pkt);
+	av_buffer_unref(&hw_enc_ctx);
 
 	void *thread_retval __attribute__((unused)) = NULL;
 	pthread_join(thr, &thread_retval);
@@ -815,6 +947,7 @@ int main(int argc, char **argv) {
 	free(src_url);
 	free(dst_url);
 	free(src_accel);
+	free(dst_accel);
 	free(src_delay);
 	free(res);
 	free(fps);
