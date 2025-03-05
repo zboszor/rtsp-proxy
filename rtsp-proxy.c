@@ -313,11 +313,8 @@ static void *thrfunc(void *arg) {
 		use_timeout = false;
 
 		AVDictionary *opts = NULL;
-		//av_dict_set(&opts, "rtsp_transport", "udp", 0);
 		av_dict_set(&opts, "rtsp_transport", "tcp", 0);
 		av_dict_set(&opts, "buffer_size", "200000", 0);
-		//av_dict_set(&opts, "hwaccel", "vaapi", 0);
-		//av_dict_set(&opts, "x264opts", "opencl", 0);
 
 		ret = quit_program ? AVERROR_EOF : avformat_open_input(&ic, src_url, NULL, &opts);
 		if (ret >= 0) {
@@ -736,11 +733,9 @@ int main(int argc, char **argv) {
 	do {
 		add_stream(&st, st.oc, &video_codec, codec_id);
 
-		/* open the codec */
 		AVDictionary *opts = NULL;
-		//av_dict_set(&opts, "hwaccel", "vaapi", 0);
-		//av_dict_set(&opts, "x264opts", "opencl", 0);
 
+		/* open the codec */
 		ret = avcodec_open2(st.enc, video_codec, &opts);
 		if (ret >= 0) {
 			/* copy the stream parameters to the muxer */
