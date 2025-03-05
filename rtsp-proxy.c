@@ -83,7 +83,7 @@ AVFrame *frames[NFRAMES];
 volatile int frame_idx; /* 0 or 1 */
 
 static AVBufferRef *hw_enc_ctx = NULL;
-static enum AVPixelFormat pixelformat = AV_PIX_FMT_YUV420P;
+static enum AVPixelFormat pixelformat;
 static enum AVPixelFormat hwpixelformat;
 static enum AVHWDeviceType hwtype;
 static int dst_width;
@@ -100,6 +100,7 @@ typedef struct OutputStream {
 	AVFormatContext *oc;
 	AVStream *st;
 	AVCodecContext *enc;
+	AVPacket *enc_pkt;
 } OutputStream;
 
 static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **codec, enum AVCodecID codec_id) {
@@ -589,6 +590,91 @@ void parse_ini_file(const char *ininame, const char *section) {
 	iniparser_freedict(dict);
 }
 
+static int rtsp_output_stream_init(OutputStream *ost) {
+	avformat_alloc_output_context2(&ost->oc, NULL, "rtsp", dst_url);
+	if (!ost->oc) {
+		printf("Could not create rtsp output context.\n");
+		return -1;
+	}
+
+	const AVOutputFormat *fmt = ost->oc->oformat;
+#if 1
+	enum AVCodecID codec_id = fmt->video_codec;
+#else
+	enum AVCodecID codec_id = AV_CODEC_ID_H264; /* too much CPU usage */
+#endif
+
+	const AVCodec *video_codec;
+	int ret;
+	do {
+		add_stream(ost, ost->oc, &video_codec, codec_id);
+
+		AVDictionary *opts = NULL;
+
+		/* open the codec */
+		ret = avcodec_open2(ost->enc, video_codec, &opts);
+		if (ret >= 0) {
+			/* copy the stream parameters to the muxer */
+			ret = avcodec_parameters_from_context(ost->st->codecpar, ost->enc);
+			if (ret >= 0) {
+				/* open the output file, if needed */
+				if (!(fmt->flags & AVFMT_NOFILE)) {
+					ret = avio_open(&ost->oc->pb, dst_url, AVIO_FLAG_WRITE);
+					if (ret < 0) {
+						printf("could not open '%s': %s\n", dst_url, av_err2str(ret));
+						avcodec_free_context(&ost->enc);
+						return 1;
+					}
+				}
+
+				ret = avformat_write_header(ost->oc, NULL);
+				if (ret < 0) {
+					printf("failed to write header: %s\n", av_err2str(ret));
+					avcodec_free_context(&ost->enc);
+					sleep(1);
+				}
+			} else {
+				printf("could not copy the stream parameters\n");
+				avcodec_free_context(&ost->enc);
+				sleep(1);
+			}
+		} else {
+			printf("could not open video codec: %s\n", av_err2str(ret));
+			sleep(1);
+		}
+
+		av_dict_free(&opts);
+	} while (!quit_program && ret < 0);
+
+	return ret;
+}
+
+static void rtsp_output_stream_loop(OutputStream *ost) {
+	int64_t pts = 0;
+	int64_t ptsinc = (int64_t)(1000.0 / fpsval);
+
+	ost->enc_pkt = av_packet_alloc();
+
+	while (!quit_program) {
+		frames[frame_idx]->pts = pts;
+
+		write_frame(ost, frames[frame_idx], ost->enc_pkt);
+
+		usleep(1000 * ptsinc);
+
+		pts++;
+	}
+}
+
+static void rtsp_output_stream_fini(OutputStream *ost) {
+	av_write_trailer(ost->oc);
+
+	avcodec_free_context(&ost->enc);
+	av_packet_free(&ost->enc_pkt);
+
+	avformat_free_context(ost->oc);
+}
+
 int main(int argc, char **argv) {
 	static struct option opts[] = {
 		{ "help",	no_argument,		NULL,	'h' },
@@ -702,64 +788,17 @@ int main(int argc, char **argv) {
 
 	printf("\n");
 
-	avformat_alloc_output_context2(&st.oc, NULL, "rtsp", dst_url);
-	if (!st.oc) {
-		printf("Could not create rtsp output context.\n");
+	if (rtsp_output_stream_init(&st) < 0)
 		return 1;
-	}
-
-	const AVOutputFormat *fmt = st.oc->oformat;
-#if 1
-	enum AVCodecID codec_id = fmt->video_codec;
-#else
-	enum AVCodecID codec_id = AV_CODEC_ID_H264; /* too much CPU usage */
-#endif
-
-	const AVCodec *video_codec;
-	int ret;
-	do {
-		add_stream(&st, st.oc, &video_codec, codec_id);
-
-		AVDictionary *opts = NULL;
-
-		/* open the codec */
-		ret = avcodec_open2(st.enc, video_codec, &opts);
-		if (ret >= 0) {
-			/* copy the stream parameters to the muxer */
-			ret = avcodec_parameters_from_context(st.st->codecpar, st.enc);
-			if (ret >= 0) {
-				/* open the output file, if needed */
-				if (!(fmt->flags & AVFMT_NOFILE)) {
-					ret = avio_open(&st.oc->pb, dst_url, AVIO_FLAG_WRITE);
-					if (ret < 0) {
-						printf("could not open '%s': %s\n", dst_url, av_err2str(ret));
-						avcodec_free_context(&st.enc);
-						return 1;
-					}
-				}
-
-				ret = avformat_write_header(st.oc, NULL);
-				if (ret < 0) {
-					printf("Failed to write header: %s\n", av_err2str(ret));
-					avcodec_free_context(&st.enc);
-					sleep(1);
-				}
-			} else {
-				printf("Could not copy the stream parameters\n");
-				avcodec_free_context(&st.enc);
-				sleep(1);
-			}
-		} else {
-			printf("Could not open video codec: %s\n", av_err2str(ret));
-			sleep(1);
-		}
-
-		av_dict_free(&opts);
-	} while (!quit_program && ret < 0);
 
 	if (quit_program)
 		return 0;
 
+	/*
+	 * YUV420P is likely the format the source (camera?) supplies.
+	 * It may be modified to NV12 for VAAPI hardware acceleration.
+	 */
+	pixelformat = AV_PIX_FMT_YUV420P;
 	av_dump_format(st.oc, 0, dst_url, 1);
 
 	/* YUV420P is likely the format the source (camera?) supplies. */
@@ -777,39 +816,21 @@ int main(int argc, char **argv) {
 		memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
 	}
 
-	int64_t pts = 0;
-	int64_t ptsinc = (int64_t)(1000.0 / fpsval);
-
 	pthread_create(&thr, NULL, thrfunc, &st);
 
-	AVPacket *enc_pkt = av_packet_alloc();
-
-	while (!quit_program) {
-		frames[frame_idx]->pts = pts;
-
-		write_frame(&st, frames[frame_idx], enc_pkt);
-
-		usleep(1000 * ptsinc);
-
-		pts++;
-	}
+	rtsp_output_stream_loop(&st);
 
 	printf("exiting...\n");
-
-	av_write_trailer(st.oc);
-
-	avcodec_free_context(&st.enc);
-	av_packet_free(&enc_pkt);
 
 	void *thread_retval __attribute__((unused)) = NULL;
 	pthread_join(thr, &thread_retval);
 
-	avformat_free_context(st.oc);
+	rtsp_output_stream_fini(&st);
 
 	for (int i = 0; i < NFRAMES; i++)
 		av_frame_free(&frames[i]);
 
-	avformat_network_init();
+	avformat_network_deinit();
 
 	free(inisection);
 	free(src_url);
