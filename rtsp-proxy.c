@@ -199,18 +199,18 @@ static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **c
 		c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 }
 
-static int write_frame(AVFormatContext *fmt_ctx, AVCodecContext *c, AVStream *st, AVFrame *frame, AVPacket *pkt) {
+static int write_frame(OutputStream *ost, AVFrame *frame, AVPacket *pkt) {
 	int ret;
 
-	// send the frame to the encoder
-	ret = avcodec_send_frame(c, frame);
+	/* send the frame to the encoder */
+	ret = avcodec_send_frame(ost->enc, frame);
 	if (ret < 0) {
-		fprintf(stderr, "Error sending a frame to the encoder: %s\n", av_err2str(ret));
+		printf("error sending a frame (format code %d vs %d) to the encoder: %s\n", pixelformat, frame->format, av_err2str(ret));
 		exit(1);
 	}
 
 	while (ret >= 0) {
-		ret = avcodec_receive_packet(c, pkt);
+		ret = avcodec_receive_packet(ost->enc, pkt);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
 			break;
 		else if (ret < 0) {
@@ -219,13 +219,13 @@ static int write_frame(AVFormatContext *fmt_ctx, AVCodecContext *c, AVStream *st
 		}
 
 		/* rescale output packet timestamp values from codec to stream timebase */
-		av_packet_rescale_ts(pkt, c->time_base, st->time_base);
-		pkt->stream_index = st->index;
+		av_packet_rescale_ts(pkt, ost->enc->time_base, ost->st->time_base);
+		pkt->stream_index = ost->st->index;
 
 		/* Write the compressed frame to the media file. */
-		//log_packet(fmt_ctx, pkt);
+		//log_packet(ost->oc, pkt);
 
-		ret = av_interleaved_write_frame(fmt_ctx, pkt);
+		ret = av_interleaved_write_frame(ost->oc, pkt);
 		/*
 		 * pkt is now blank (av_interleaved_write_frame() takes ownership of
 		 * its contents and resets pkt), so that no unreferencing is necessary.
@@ -696,7 +696,7 @@ int main(int argc, char **argv) {
 			printf(" %s", av_hwdevice_get_type_name(hwtype));
 		printf("\n");
 	} else if (src_accel) {
-		printf("Attempting to use \"%s\" hardware acceleration for decoding\n", src_accel);
+		printf("Attempting to use %s hardware acceleration for decoding\n", src_accel);
 		try_hwaccel = true;
 	}
 
@@ -787,7 +787,7 @@ int main(int argc, char **argv) {
 	while (!quit_program) {
 		frames[frame_idx]->pts = pts;
 
-		write_frame(st.oc, st.enc, st.st, frames[frame_idx], enc_pkt);
+		write_frame(&st, frames[frame_idx], enc_pkt);
 
 		usleep(1000 * ptsinc);
 
