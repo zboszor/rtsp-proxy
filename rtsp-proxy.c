@@ -625,10 +625,12 @@ int main(int argc, char **argv) {
 			printf("-d url, --dst url\n\tDestination video file or URL\n");
 			printf("-a <accel>, --src-accel <accel>\n\tHardware acceleration method for decoding.\n");
 			printf("\tAvailable device types:");
-			hwtype = AV_HWDEVICE_TYPE_NONE;
-			while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
-				printf(" %s", av_hwdevice_get_type_name(hwtype));
-			printf("\n");
+			{
+				enum AVHWDeviceType hwtype = AV_HWDEVICE_TYPE_NONE;
+				while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
+					printf(" %s", av_hwdevice_get_type_name(hwtype));
+				printf("\n");
+			}
 			printf("-r WxH, --res WxH\n\tDestination video resolution\n");
 			printf("-f N, --fps N\n\tDestination video frame rate\n");
 			printf("-w N, --src-delay\n\tWait N seconds before opening the source\n");
@@ -693,8 +695,8 @@ int main(int argc, char **argv) {
 		while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
 			printf(" %s", av_hwdevice_get_type_name(hwtype));
 		printf("\n");
-	} else {
-		printf("Attempting to use \"%s\" hardware acceleration\n", src_accel);
+	} else if (src_accel) {
+		printf("Attempting to use \"%s\" hardware acceleration for decoding\n", src_accel);
 		try_hwaccel = true;
 	}
 
