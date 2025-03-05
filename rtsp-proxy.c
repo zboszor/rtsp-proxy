@@ -292,7 +292,7 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
 static void *thrfunc(void *arg) {
 	OutputStream *st = arg;
 
-	while (!st->enc)
+	while (!quit_program && !st->enc)
 		usleep(100000);
 
 	if (delay)
