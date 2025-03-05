@@ -623,7 +623,7 @@ int main(int argc, char **argv) {
 			printf("-i <section>, --ini <section>\n\tRead options from [section] in /etc/rtsp-proxy.ini\n");
 			printf("-s url, --src url\n\tSource video file or URL\n");
 			printf("-d url, --dst url\n\tDestination video file or URL\n");
-			printf("-a <accel>, --accel <accel>\n\tHardware acceleration method for decoding.\n");
+			printf("-a <accel>, --src-accel <accel>\n\tHardware acceleration method for decoding.\n");
 			printf("\tAvailable device types:");
 			hwtype = AV_HWDEVICE_TYPE_NONE;
 			while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
