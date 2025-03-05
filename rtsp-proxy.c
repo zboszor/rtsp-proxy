@@ -702,21 +702,6 @@ int main(int argc, char **argv) {
 
 	printf("\n");
 
-	/* YUV420P is likely the format the source (camera?) supplies. */
-	for (int i = 0; i < NFRAMES; i++) {
-		frames[i] = av_frame_alloc();
-		frames[i]->width = dst_width;
-		frames[i]->height = dst_height;
-		frames[i]->format = pixelformat;
-
-		av_frame_get_buffer(frames[i], 0);
-
-		/* Weird green frame */
-		memset(frames[i]->data[0], 0x80, frames[i]->linesize[0] * frames[i]->height);		/* Y = 0x80 */
-		memset(frames[i]->data[1], 0x00, frames[i]->linesize[1] * frames[i]->height / 2);	/* U = 0x00 */
-		memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
-	}
-
 	avformat_alloc_output_context2(&st.oc, NULL, "rtsp", dst_url);
 	if (!st.oc) {
 		printf("Could not create rtsp output context.\n");
@@ -776,6 +761,21 @@ int main(int argc, char **argv) {
 		return 0;
 
 	av_dump_format(st.oc, 0, dst_url, 1);
+
+	/* YUV420P is likely the format the source (camera?) supplies. */
+	for (int i = 0; i < NFRAMES; i++) {
+		frames[i] = av_frame_alloc();
+		frames[i]->width = dst_width;
+		frames[i]->height = dst_height;
+		frames[i]->format = pixelformat;
+
+		av_frame_get_buffer(frames[i], 0);
+
+		/* Weird green frame */
+		memset(frames[i]->data[0], 0x80, frames[i]->linesize[0] * frames[i]->height);		/* Y = 0x80 */
+		memset(frames[i]->data[1], 0x00, frames[i]->linesize[1] * frames[i]->height / 2);	/* U = 0x00 */
+		memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
+	}
 
 	int64_t pts = 0;
 	int64_t ptsinc = (int64_t)(1000.0 / fpsval);
