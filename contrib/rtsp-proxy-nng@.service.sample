@@ -1,0 +1,10 @@
+[Unit]
+Description=RTSP proxy service for %i
+ConditionPathExists=/etc/rtsp-proxy.ini
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rtsp-proxy --ini %i
+
+[Install]
+WantedBy=multi-user.target
