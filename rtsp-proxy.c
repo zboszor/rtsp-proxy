@@ -293,6 +293,7 @@ static int rtsp_source_interrupt_cb(void *dummy __attribute__((unused))) {
 	/* At least 2 fps is expected from the rtsp source */
 	if (use_timeout && (diff > 500000000)) {
 		printf("%s: timeout\n", __func__);
+		decoder_started = false;
 		return 1;
 	}
 
