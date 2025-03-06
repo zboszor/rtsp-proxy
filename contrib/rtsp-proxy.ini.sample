@@ -4,3 +4,10 @@ SourceDelay=3
 DestURL=rtsp://127.0.0.1:8554/my_feed
 DestResolution=800x600
 DestFPS=24
+
+[feed1_nng]
+SourceURL=rtsp://192.168.1.150/Main
+SourceDelay=3
+DestURL=nng:tcp://*:9999
+DestResolution=800x600
+DestFPS=24
