@@ -39,6 +39,7 @@
 #include <config.h>
 
 #include <assert.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -61,6 +62,17 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <poll.h>
+
+#define NNG_ELIDE_DEPRECATED 1
+#include <nng/nng.h>
+#include <nng/protocol/pubsub0/pub.h>
+#include <nng/transport/ipc/ipc.h>
+#include <nng/transport/tcp/tcp.h>
+
 #if LIBAVCODEC_VERSION_MAJOR < 61
 #error "This software requires FFmpeg 7.0 or newer"
 #endif
@@ -80,7 +92,7 @@ static char *src_delay;
 
 #define NFRAMES (2)
 AVFrame *frames[NFRAMES];
-volatile int frame_idx; /* 0 or 1 */
+static volatile int frame_idx; /* 0 or 1 */
 
 static AVBufferRef *hw_enc_ctx = NULL;
 static enum AVPixelFormat pixelformat;
@@ -91,6 +103,8 @@ static int dst_height;
 static double fpsval;
 static long delay;
 static bool try_hwaccel;
+static bool use_nng = false;
+static volatile bool decoder_started;
 
 static void sighandler(int signum) {
 	quit_program = 1;
@@ -101,6 +115,14 @@ typedef struct OutputStream {
 	AVStream *st;
 	AVCodecContext *enc;
 	AVPacket *enc_pkt;
+
+	nng_socket nng_sock;
+	int pipefd[2];
+	char shmname[NFRAMES][64];
+	int shmfd[NFRAMES];
+	size_t shm_framesize[NFRAMES];
+	void *shmptr[NFRAMES];
+	void *old_frame_data[NFRAMES];
 } OutputStream;
 
 static void add_stream(OutputStream *ost, AVFormatContext *oc, const AVCodec **codec, enum AVCodecID codec_id) {
@@ -292,13 +314,13 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelF
 static void *thrfunc(void *arg) {
 	OutputStream *st = arg;
 
-	while (!quit_program && !st->enc)
+	while (!use_nng && !quit_program && !st->enc)
 		usleep(100000);
 
 	if (delay)
 		sleep(delay);
 
-	printf("\nReader thread started\n");
+	printf("Reader thread started\n");
 
 	int ret;
 	AVCodecContext *dec = NULL;
@@ -306,6 +328,8 @@ static void *thrfunc(void *arg) {
 	bool use_hwaccel = try_hwaccel;
 
 	do {
+		decoder_started = false;
+
 		AVFormatContext *ic = avformat_alloc_context();
 
 		/* Add interrupt callback */
@@ -369,7 +393,7 @@ static void *thrfunc(void *arg) {
 
 							dec->get_format  = get_hw_format;
 
-							printf("Attempting to use hardware acceleration for decoding\n");
+							printf("Attempting to use %s hardware acceleration for decoding\n", src_accel);
 
 							ret = av_hwdevice_ctx_create(&hw_dec_ctx, hwtype, NULL, NULL, 0);
 							if (ret >= 0) {
@@ -417,6 +441,7 @@ static void *thrfunc(void *arg) {
 										if (ret >= 0) {
 											if (!valid_zerocopy) {
 												valid_zerocopy = true;
+												decoder_started = true;
 
 												use_zerocopy =
 													dst_width == dec->width &&
@@ -462,16 +487,27 @@ static void *thrfunc(void *arg) {
 
 													/* convert to destination format */
 													if (!use_zerocopy) {
-														AVFrame *dst_frame = frames[1 - frame_idx];
+														int new_frame_idx = 1 - frame_idx;
+														AVFrame *dst_frame = frames[new_frame_idx];
 
 														ret = sws_scale(sws_ctx,
 																	(const uint8_t * const *)tmp_frame->data,
 																	tmp_frame->linesize, 0, tmp_frame->height,
 																	dst_frame->data, dst_frame->linesize);
-													}
 
-													if (ret >= 0) {
-														frame_idx = 1 - frame_idx;
+														if (use_nng) {
+															ret = write(st->pipefd[1], &new_frame_idx, sizeof(new_frame_idx));
+															assert(ret == sizeof(new_frame_idx));
+														} else
+															frame_idx = new_frame_idx;
+													} else if (ret >= 0) {
+														int new_frame_idx = 1 - frame_idx;
+
+														if (use_nng) {
+															ret = write(st->pipefd[1], &new_frame_idx, sizeof(new_frame_idx));
+															assert(ret == sizeof(new_frame_idx));
+														} else
+															frame_idx = new_frame_idx;
 
 														if (file_based)
 															usleep(frame_delay);
@@ -675,6 +711,94 @@ static void rtsp_output_stream_fini(OutputStream *ost) {
 	avformat_free_context(ost->oc);
 }
 
+static int nng_output_stream_init(OutputStream *ost) {
+	int ret;
+
+	ost->pipefd[0] = -1;
+	ost->pipefd[1] = -1;
+	if ((ret = pipe(ost->pipefd) < 0)) {
+		printf("creating communication pipe between threads failed\n");
+		return -1;
+	}
+
+	//fcntl(ost->pipefd[0], F_SETFL, fcntl(ost->pipefd[0], F_GETFL) | O_NONBLOCK);
+
+	/* Create the socket */
+	if ((ret = nng_pub0_open(&ost->nng_sock)) < 0) {
+		printf("nng_pub0_open failed: %s\n", nng_strerror(ret));
+		return -1;
+	}
+
+	/* dst_url has the "nng:" prefix, and must have a valid nng URL  */
+	if ((ret = nng_listen(ost->nng_sock, dst_url + 4, NULL, 0)) < 0) {
+		printf("nng_listen failed: %s\n", nng_strerror(ret));
+		return -1;
+	}
+
+	return 0;
+}
+
+static void nng_output_stream_loop(OutputStream *ost) {
+	int ret;
+	char msgtext[128];
+
+	while (!quit_program) {
+		int new_frame_idx = frame_idx;
+
+		int64_t ptsinc = decoder_started ? -1 : (int64_t)(1000.0 / fpsval);
+
+		struct pollfd pfd = { .fd = ost->pipefd[0], .events = POLLIN};
+
+		ret = poll(&pfd, 1, (int)ptsinc);
+		if (ret < 0 || quit_program)
+			break;
+
+		if (ret == 1 && (pfd.revents | POLLIN)) {
+			ret = read(ost->pipefd[0], &new_frame_idx, sizeof(new_frame_idx));
+
+			if (ret == sizeof(int))
+				frame_idx = new_frame_idx;
+			else {
+				/* should not happen */
+				new_frame_idx = frame_idx;
+			}
+		}
+
+		int msgsz = sprintf(msgtext, "%s %d %d %d", ost->shmname[new_frame_idx], dst_width, dst_height, frames[new_frame_idx]->linesize[0]);
+		assert(msgsz >= 0);
+
+		nng_msg *msg;
+
+		if ((ret = nng_msg_alloc(&msg, msgsz + 1)) != 0) {
+			printf("nng_msg_alloc failed: %s\n", nng_strerror(ret));
+			break;
+		}
+
+		char *msgbody = nng_msg_body(msg);
+		memcpy(msgbody, msgtext, msgsz + 1);
+
+		if ((ret = nng_sendmsg(ost->nng_sock, msg, 0)) != 0)
+			nng_msg_free(msg);
+	}
+}
+
+static void nng_output_stream_fini(OutputStream *ost) {
+	nng_close(ost->nng_sock);
+
+	close(ost->pipefd[0]);
+	close(ost->pipefd[1]);
+
+	for (int i = 0; i < NFRAMES; i++) {
+		if (ost->shmptr[i] && ost->shmptr[i] != MAP_FAILED)
+			munmap(ost->shmptr[i], ost->shm_framesize[i]);
+		if (ost->shmname[i][0])
+			shm_unlink(ost->shmname[i]);
+
+		if (ost->old_frame_data[i])
+			frames[i]->data[0] = ost->old_frame_data[i];
+	}
+}
+
 int main(int argc, char **argv) {
 	static struct option opts[] = {
 		{ "help",	no_argument,		NULL,	'h' },
@@ -765,7 +889,7 @@ int main(int argc, char **argv) {
 
 	if (!src_url || !dst_url) {
 		printf("source or destination not specified\n");
-		return 1;
+		goto error;
 	}
 
 	printf("Source stream URL: %s\n", src_url ? src_url : "unset, error");
@@ -781,25 +905,35 @@ int main(int argc, char **argv) {
 		while((hwtype = av_hwdevice_iterate_types(hwtype)) != AV_HWDEVICE_TYPE_NONE)
 			printf(" %s", av_hwdevice_get_type_name(hwtype));
 		printf("\n");
-	} else if (src_accel) {
-		printf("Attempting to use %s hardware acceleration for decoding\n", src_accel);
+	} else if (src_accel)
 		try_hwaccel = true;
-	}
 
 	printf("\n");
 
-	if (rtsp_output_stream_init(&st) < 0)
-		return 1;
+	if (strncmp(dst_url, "nng:", 4) == 0)
+		use_nng = true;
+
+	if (use_nng) {
+		if (nng_output_stream_init(&st) < 0)
+			goto error;
+	} else {
+		if (rtsp_output_stream_init(&st) < 0)
+			goto error;
+	}
 
 	if (quit_program)
-		return 0;
+		goto error;
 
-	/*
-	 * YUV420P is likely the format the source (camera?) supplies.
-	 * It may be modified to NV12 for VAAPI hardware acceleration.
-	 */
-	pixelformat = AV_PIX_FMT_YUV420P;
-	av_dump_format(st.oc, 0, dst_url, 1);
+	if (use_nng)
+		pixelformat = AV_PIX_FMT_RGBA;
+	else {
+		/*
+		 * YUV420P is likely the format the source (camera?) supplies.
+		 * It may be modified to NV12 for VAAPI hardware acceleration.
+		 */
+		pixelformat = AV_PIX_FMT_YUV420P;
+		av_dump_format(st.oc, 0, dst_url, 1);
+	}
 
 	/* YUV420P is likely the format the source (camera?) supplies. */
 	for (int i = 0; i < NFRAMES; i++) {
@@ -810,22 +944,59 @@ int main(int argc, char **argv) {
 
 		av_frame_get_buffer(frames[i], 0);
 
-		/* Weird green frame */
-		memset(frames[i]->data[0], 0x80, frames[i]->linesize[0] * frames[i]->height);		/* Y = 0x80 */
-		memset(frames[i]->data[1], 0x00, frames[i]->linesize[1] * frames[i]->height / 2);	/* U = 0x00 */
-		memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
+		if (pixelformat == AV_PIX_FMT_YUV420P) {
+			/* Weird green frame for YUV420P, else leave it alone */
+			memset(frames[i]->data[0], 0x80, frames[i]->linesize[0] * frames[i]->height);		/* Y = 0x80 */
+			memset(frames[i]->data[1], 0x00, frames[i]->linesize[1] * frames[i]->height / 2);	/* U = 0x00 */
+			memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
+		} else if (use_nng) {
+			/*
+			 * Don't both re-encoding into a different format.
+			 * Instead, create POSIX shared memory segments and
+			 * switch them out with the frames' data[0]
+			 */
+			sprintf(st.shmname[i], "/image-data-%d-%d", getpid(), i);
+			st.shmfd[i] = shm_open(st.shmname[i], O_CREAT | O_EXCL | O_RDWR, 0644);
+			if (st.shmfd[i] < 0) {
+				printf("creating posix shared memory segment %s failed: %s", st.shmname[i], strerror(errno));
+				goto error;
+			}
+
+			st.shm_framesize[i] = dst_height * frames[i]->linesize[0];
+			if (ftruncate(st.shmfd[i], st.shm_framesize[i]) == -1) {
+				printf("resizing posix shared memory segment %s failed: %s\n", st.shmname[i], strerror(errno));
+				goto error;
+			}
+
+			st.shmptr[i] = mmap(NULL, st.shm_framesize[i], PROT_READ | PROT_WRITE, MAP_SHARED, st.shmfd[i], 0);
+			if (st.shmptr[i] == MAP_FAILED) {
+				printf("mmap failed for osix shared memory segment %s\n", st.shmfd[i]);
+				goto error;
+			}
+
+			/* Patch frames' data pointer so rendering happens in shared memory */
+			st.old_frame_data[i] = frames[i]->data[0];
+			frames[i]->data[0] = st.shmptr[i];
+		}
 	}
 
 	pthread_create(&thr, NULL, thrfunc, &st);
 
-	rtsp_output_stream_loop(&st);
+	if (use_nng)
+		nng_output_stream_loop(&st);
+	else
+		rtsp_output_stream_loop(&st);
 
 	printf("exiting...\n");
 
 	void *thread_retval __attribute__((unused)) = NULL;
 	pthread_join(thr, &thread_retval);
 
-	rtsp_output_stream_fini(&st);
+	error:
+	if (use_nng)
+		nng_output_stream_fini(&st);
+	else
+		rtsp_output_stream_fini(&st);
 
 	for (int i = 0; i < NFRAMES; i++)
 		av_frame_free(&frames[i]);

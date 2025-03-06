@@ -21,9 +21,14 @@ PKG_CHECK_MODULES(FFMPEG, libavformat libavcodec libavutil libswscale)
 AC_SUBST(FFMPEG_CFLAGS)
 AC_SUBST(FFMPEG_LIBS)
 
+AC_CHECK_HEADERS(nng/nng.h, [], [AC_MSG_ERROR([nng/nng.h not found])])
+AC_CHECK_LIB(nng, nng_listen, [NNG_LIBS=-lnng], [AC_MSG_ERROR([nng library not found])])
+AC_SUBST(NNG_LIBS)
+
 AC_CHECK_HEADERS(iniparser/iniparser.h, [],
 	[AC_CHECK_HEADERS(iniparser.h, [], [AC_MSG_ERROR([iniparser.h not found])])])
-AC_CHECK_LIB(iniparser, iniparser_load, [], [AC_MSG_ERROR([iniparser library not found])], [])
+AC_CHECK_LIB(iniparser, iniparser_load, [INIPARSER_LIBS=-liniparser], [AC_MSG_ERROR([iniparser library not found])], [])
+AC_SUBST(INIPARSER_LIBS)
 
 AC_CONFIG_FILES([
 	Makefile
