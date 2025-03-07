@@ -971,7 +971,7 @@ int main(int argc, char **argv) {
 
 			st.shmptr[i] = mmap(NULL, st.shm_framesize[i], PROT_READ | PROT_WRITE, MAP_SHARED, st.shmfd[i], 0);
 			if (st.shmptr[i] == MAP_FAILED) {
-				printf("mmap failed for osix shared memory segment %s\n", st.shmfd[i]);
+				printf("mmap failed for posix shared memory segment %s\n", st.shmname[i]);
 				goto error;
 			}
 
