@@ -704,7 +704,8 @@ static void rtsp_output_stream_loop(OutputStream *ost) {
 }
 
 static void rtsp_output_stream_fini(OutputStream *ost) {
-	av_write_trailer(ost->oc);
+	if (ost->oc)
+		av_write_trailer(ost->oc);
 
 	avcodec_free_context(&ost->enc);
 	av_packet_free(&ost->enc_pkt);
