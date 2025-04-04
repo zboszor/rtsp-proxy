@@ -399,6 +399,7 @@ static void *thrfunc(void *arg) {
 							ret = av_hwdevice_ctx_create(&hw_dec_ctx, hwtype, NULL, NULL, 0);
 							if (ret >= 0) {
 								dec->hw_device_ctx = av_buffer_ref(hw_dec_ctx);
+								av_buffer_unref(&hw_dec_ctx);
 							} else {
 								printf("hardware decoder initialization failed\n");
 								dec->get_format = old_get_format;
@@ -414,12 +415,7 @@ static void *thrfunc(void *arg) {
 
 							AVPacket *dec_pkt = av_packet_alloc();
 
-							struct SwsContext *sws_ctx =
-								sws_getContext(dec->width, dec->height, dec->pix_fmt,
-												dst_width, dst_height, pixelformat,
-												SWS_BILINEAR, NULL, NULL, NULL);
-							assert(sws_ctx);
-
+							struct SwsContext *sws_ctx = NULL;
 							av_read_play(ic);
 
 							AVFrame *hw_frame = use_hwaccel ? av_frame_alloc() : NULL;
@@ -473,11 +469,13 @@ static void *thrfunc(void *arg) {
 
 													if (use_hwaccel) {
 														if (hw_frame->format == hwpixelformat) {
-															/* retrieve data from GPU to CPU */
-															ret = av_hwframe_transfer_data(dec_frame, hw_frame, 0);
-															if (ret >= 0) {
+															if (hwpixelformat == AV_PIX_FMT_VULKAN)
+																tmp_frame = av_frame_alloc();
+															else
 																tmp_frame = dec_frame;
-															} else
+															/* retrieve data from GPU to CPU */
+															ret = av_hwframe_transfer_data(tmp_frame, hw_frame, 0);
+															if (ret < 0)
 																printf("error transferring the data to system memory\n");
 														} else {
 															tmp_frame = hw_frame;
@@ -486,10 +484,22 @@ static void *thrfunc(void *arg) {
 														tmp_frame = dec_frame;
 													}
 
-													/* convert to destination format */
-													if (!use_zerocopy) {
+													/*
+													 * Convert to destination format
+													 * For Vulkan acceleration, an intermediary frame is used
+													 * because it doesn't directly support decoding into RGBA,
+													 * unlike VAAPI.
+													 */
+													if (!use_zerocopy || (use_hwaccel && hwpixelformat == AV_PIX_FMT_VULKAN)) {
 														int new_frame_idx = 1 - frame_idx;
 														AVFrame *dst_frame = frames[new_frame_idx];
+
+														if (!sws_ctx) {
+															sws_ctx = sws_getContext(tmp_frame->width, tmp_frame->height, tmp_frame->format,
+																					dst_width, dst_height, pixelformat,
+																					SWS_BILINEAR, NULL, NULL, NULL);
+															assert(sws_ctx);
+														}
 
 														ret = sws_scale(sws_ctx,
 																	(const uint8_t * const *)tmp_frame->data,
@@ -501,6 +511,9 @@ static void *thrfunc(void *arg) {
 															assert(ret == sizeof(new_frame_idx));
 														} else
 															frame_idx = new_frame_idx;
+
+														if (use_hwaccel && hwpixelformat == AV_PIX_FMT_VULKAN)
+															av_frame_free(&tmp_frame);
 													} else if (ret >= 0) {
 														int new_frame_idx = 1 - frame_idx;
 
@@ -771,13 +784,13 @@ static void nng_output_stream_loop(OutputStream *ost) {
 
 		nng_msg *msg;
 
-		if ((ret = nng_msg_alloc(&msg, msgsz + 1)) != 0) {
+		if ((ret = nng_msg_alloc(&msg, msgsz)) != 0) {
 			printf("nng_msg_alloc failed: %s\n", nng_strerror(ret));
 			break;
 		}
 
 		char *msgbody = nng_msg_body(msg);
-		memcpy(msgbody, msgtext, msgsz + 1);
+		memcpy(msgbody, msgtext, msgsz);
 
 		if ((ret = nng_sendmsg(ost->nng_sock, msg, 0)) != 0)
 			nng_msg_free(msg);
@@ -846,7 +859,7 @@ int main(int argc, char **argv) {
 			printf("-r WxH, --res WxH\n\tDestination video resolution\n");
 			printf("-f N, --fps N\n\tDestination video frame rate\n");
 			printf("-w N, --src-delay\n\tWait N seconds before opening the source\n");
-			return 0;
+			goto quit;
 		case 'i':
 			free(inisection);
 			inisection = optarg ? strdup(optarg) : NULL;
@@ -1005,6 +1018,7 @@ int main(int argc, char **argv) {
 
 	avformat_network_deinit();
 
+quit:
 	free(inisection);
 	free(src_url);
 	free(dst_url);
