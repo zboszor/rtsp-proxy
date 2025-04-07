@@ -24,7 +24,10 @@ while frames < 50:
     print(x)
     if x[0] not in shmaps:
         shmname = x[0].lstrip('/')
-        # Use track=False to let the server remove the memory block
+        # Use track=False to let the server remove its own memory block
+        # when it exits. Otherwise this client will remove the shared
+        # memory block, # making the previously shared memory private
+        # to the server.
         shmaps[x[0]] = shm.SharedMemory(name=shmname, track=False)
 
     filename = "raw-%03d.rgba" % frames
