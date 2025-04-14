@@ -3,6 +3,7 @@ Description=RTSP proxy service for %i
 ConditionPathExists=/etc/rtsp-proxy.ini
 
 [Service]
+Environment=ANV_VIDEO_DECODE=1 ANV_VIDEO_ENCODE=1
 Type=simple
 ExecStart=/usr/bin/rtsp-proxy --ini %i
 
