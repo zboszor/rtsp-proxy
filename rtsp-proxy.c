@@ -778,7 +778,7 @@ static void nng_output_stream_loop(OutputStream *ost) {
 			}
 		}
 
-		int msgsz = sprintf(msgtext, "%s %d %d %d", ost->shmname[new_frame_idx], dst_width, dst_height, frames[new_frame_idx]->linesize[0]);
+		int msgsz = sprintf(msgtext, "%s %d %d %d %d", ost->shmname[new_frame_idx], dst_width, dst_height, frames[new_frame_idx]->linesize[0], decoder_started);
 		assert(msgsz >= 0);
 
 		nng_msg *msg;
