@@ -3,8 +3,12 @@ RTSP proxy for flaky (wifi) cameras
 
 This code uses FFmpeg libraries to read an RTSP source feed and
 transcode its video stream (no audio!) to a destination feed.
+
 The destination server is provided by `mediamtx` or `rtsp-simple-server`
 which must be running in advance.
+
+Alternatively, the decoded frame data can be put into shared memory.
+This way, the consumer of image data can use it directly.
 
 Connection to some cameras may be flaky which can result in
 a terminated stream, which in turn makes the viewer application stop.
@@ -15,7 +19,7 @@ feed and reconnects to the source as soon as possible.
 
 The viewer application does not notice anything.
 
-The INI configuration for `rtsp-proxy` is `/etc/rtsp-proxy.ini`:
+The INI configuration for `rtsp-proxy` is `/etc/rtsp-proxy.ini` by default:
 ```
 [feed1]
 SourceURL=rtsp://192.168.1.150/Main
@@ -29,6 +33,9 @@ DestFPS=24
 The configuration file usage is activated with command line option
 `-i <section>` or `--ini <section>` where `[section]` is in the
 ini file.
+
+The configuration file path can be specified with `-c <file>` or
+`--config <file>`.
 
 `SourceURL` is the URL for the source feed. It may also be a path
 to a video file which is decoded at its own frame rate. It is
@@ -45,6 +52,20 @@ It is equivalent to the command line option `-w <N>` or
 
 `DestURL` is the URL for the destination feed. It is equivalent
 to the command line option `-d <URL>` or `--dst <URL>`.
+
+When `DestURL` is prefixed with `nng:`, then a valid NNG URI has
+to be specified for the PUB-SUB protocol. See
+https://github.com/nanomsg/nng. In this case, the frame data is
+decoded into POSIX shared memory, and an NNG message is sent to
+the subscribers in this format:
+```
+shared-memory-segment-name width height stride src-connected
+```
+
+The shared memory segment name is something like `/image-data-XXXX-Y`.
+The frame data parameters (width, height, stride) are followed by
+a boolean flag indicating that the `rtsp-proxy` is connected to the
+source stream.
 
 `DestResolution` is the frame resolution for the destination feed.
 It is equivalent to the command line option `-r WxH` or `--res WxH`.
