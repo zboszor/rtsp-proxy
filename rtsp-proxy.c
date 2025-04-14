@@ -816,6 +816,7 @@ static void nng_output_stream_fini(OutputStream *ost) {
 int main(int argc, char **argv) {
 	static struct option opts[] = {
 		{ "help",	no_argument,		NULL,	'h' },
+		{ "config",	required_argument,	NULL,	'c' },
 		{ "ini",	required_argument,	NULL,	'i' },
 		{ "src",	required_argument,	NULL,	's' },
 		{ "dst",	required_argument,	NULL,	'd' },
@@ -825,6 +826,7 @@ int main(int argc, char **argv) {
 		{ "src-delay",	required_argument,	NULL,	'w' },
 		{ NULL,		0,					NULL,	0   },
 	};
+	char *configfile = NULL;
 	char *inisection = NULL;
 	OutputStream st;
 	pthread_t thr;
@@ -835,7 +837,7 @@ int main(int argc, char **argv) {
 	signal(SIGTERM, sighandler);
 
 	while (1) {
-		int c = getopt_long(argc, argv, "a:hi:s:d:r:f:w:", opts, NULL);
+		int c = getopt_long(argc, argv, "a:hc:i:s:d:r:f:w:", opts, NULL);
 
 		if (c == -1)
 			break;
@@ -844,7 +846,8 @@ int main(int argc, char **argv) {
 		case 'h':
 			printf("RTSP proxy using FFmpeg libraries\n\nOptions:\n");
 			printf("-h, --help\n\tThis help text.\n");
-			printf("-i <section>, --ini <section>\n\tRead options from [section] in /etc/rtsp-proxy.ini\n");
+			printf("-c <configuration>, --config <configuration>\n\tUse configuration file instead of /etc/rtsp-proxy.ini\n");
+			printf("-i <section>, --ini <section>\n\tRead options from [section] in the configuration file\n");
 			printf("-s url, --src url\n\tSource video file or URL\n");
 			printf("-d url, --dst url\n\tDestination video file or URL\n");
 			printf("-a <accel>, --src-accel <accel>\n\tHardware acceleration method for decoding.\n");
@@ -859,6 +862,10 @@ int main(int argc, char **argv) {
 			printf("-f N, --fps N\n\tDestination video frame rate\n");
 			printf("-w N, --src-delay\n\tWait N seconds before opening the source\n");
 			goto quit;
+		case 'c':
+			free(configfile);
+			configfile = optarg ? strdup(optarg) : NULL;
+			break;
 		case 'i':
 			free(inisection);
 			inisection = optarg ? strdup(optarg) : NULL;
@@ -890,8 +897,11 @@ int main(int argc, char **argv) {
 		}
 	}
 
+	if (!configfile)
+		configfile = strdup("/etc/rtsp-proxy.ini");
+
 	if (inisection)
-		parse_ini_file("/etc/rtsp-proxy.ini", inisection);
+		parse_ini_file(configfile, inisection);
 
 	if (!res || av_parse_video_size(&dst_width, &dst_height, res) < 0) {
 		dst_width = 800;
@@ -1018,6 +1028,7 @@ int main(int argc, char **argv) {
 	avformat_network_deinit();
 
 quit:
+	free(configfile);
 	free(inisection);
 	free(src_url);
 	free(dst_url);
