@@ -959,7 +959,6 @@ int main(int argc, char **argv) {
 		av_dump_format(st.oc, 0, dst_url, 1);
 	}
 
-	/* YUV420P is likely the format the source (camera?) supplies. */
 	for (int i = 0; i < NFRAMES; i++) {
 		frames[i] = av_frame_alloc();
 		frames[i]->width = dst_width;
@@ -975,7 +974,7 @@ int main(int argc, char **argv) {
 			memset(frames[i]->data[2], 0x80, frames[i]->linesize[2] * frames[i]->height / 2);	/* V = 0x80 */
 		} else if (use_nng) {
 			/*
-			 * Don't both re-encoding into a different format.
+			 * Don't bother re-encoding into a different format.
 			 * Instead, create POSIX shared memory segments and
 			 * switch them out with the frames' data[0]
 			 */
